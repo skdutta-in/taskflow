@@ -403,7 +403,7 @@ export default function App() {
         <div style={{ flex: 1, padding: "0 16px 20px", overflowY: "auto" }}>
           {filteredTasks.length === 0 ? (
             <div style={{ textAlign: "center", padding: "60px 20px", color: T.textMuted }}>
-              <div style={{ fontSize: 40, marginBottom: 12 }}>✦</div>
+              <div style={{ fontSize: 40, marginBottom: 12 }}>✨</div>
               <div style={{ fontSize: 15 }}>No tasks here</div>
               <div style={{ fontSize: 12, marginTop: 4 }}>Tap + to add one</div>
             </div>
