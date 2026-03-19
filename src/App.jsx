@@ -200,21 +200,29 @@ export default function App() {
   const [settings, setSettings] = useState(() => { try { const s=localStorage.getItem("taskflow_settings"); return s?{...DEFAULT_SETTINGS,...JSON.parse(s)}:DEFAULT_SETTINGS; } catch { return DEFAULT_SETTINGS; } });
 
   // Google Drive state
-  const [gUser, setGUser]           = useState(null);   // { name, email, picture }
-  const [gToken, setGToken]         = useState(null);
+  const [gUser, setGUser]             = useState(null);
+  const [gToken, setGToken]           = useState(null);
   const [driveFileId, setDriveFileId] = useState(null);
-  const [syncStatus, setSyncStatus] = useState("idle"); // idle | syncing | ok | error
-  const [lastSaved, setLastSaved]   = useState("");
-  const [showGDrive, setShowGDrive] = useState(false);
-  const syncTimer                   = useRef(null);
-  const gsiLoaded                   = useRef(false);
+  const [syncStatus, setSyncStatus]   = useState("idle");
+  const [lastSaved, setLastSaved]     = useState("");
+  const [showGDrive, setShowGDrive]   = useState(false);
+  const syncTimer                     = useRef(null);
+  const tokenRefreshTimer             = useRef(null);
+  const gsiLoaded                     = useRef(false);
+  const tokenClientRef                = useRef(null);  // keep client alive for silent refresh
+  const gTokenRef                     = useRef(null);  // always-current token for callbacks
+  const driveFileIdRef                = useRef(null);  // always-current fileId for callbacks
 
-  const [showForm, setShowForm]         = useState(false);
-  const [editTask, setEditTask]         = useState(null);
-  const [selectedTask, setSelectedTask] = useState(null);
-  const [showCSV, setShowCSV]           = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [importError, setImportError]   = useState("");
+  // Keep refs in sync with state so async callbacks always read latest value
+  useEffect(() => { gTokenRef.current      = gToken;      }, [gToken]);
+  useEffect(() => { driveFileIdRef.current = driveFileId; }, [driveFileId]);
+
+  const [showForm, setShowForm]           = useState(false);
+  const [editTask, setEditTask]           = useState(null);
+  const [selectedTask, setSelectedTask]   = useState(null);
+  const [showCSV, setShowCSV]             = useState(false);
+  const [showSettings, setShowSettings]   = useState(false);
+  const [importError, setImportError]     = useState("");
   const [importSuccess, setImportSuccess] = useState("");
   const [form, setForm] = useState({ title:"", priority:"normal", dueDate:getToday(), dependsOn:[], blocks:[], notes:"" });
   const fileInputRef = useRef(null);
@@ -231,42 +239,90 @@ export default function App() {
     const script = document.createElement("script");
     script.src = "https://accounts.google.com/gsi/client";
     script.async = true;
-    script.onload = () => { gsiLoaded.current = true; };
+    script.onload = () => {
+      gsiLoaded.current = true;
+      // Auto sign-in if user was previously signed in
+      try {
+        const saved = localStorage.getItem("taskflow_guser");
+        if (saved) {
+          setGUser(JSON.parse(saved));
+          // Silently get a fresh token on page load
+          setTimeout(() => silentTokenRefresh(), 500);
+        }
+      } catch {}
+    };
     document.head.appendChild(script);
-    // Restore saved token info
-    try {
-      const saved = localStorage.getItem("taskflow_guser");
-      if (saved) setGUser(JSON.parse(saved));
-    } catch {}
   }, []);
 
-  // ── Google Sign In ────────────────────────────────────────────────────────
-  function handleGoogleSignIn() {
-    if (!window.google) { alert("Google SDK not loaded yet, please wait a moment and try again."); return; }
-    const client = window.google.accounts.oauth2.initTokenClient({
+  // ── Build (or reuse) the token client ────────────────────────────────────
+  function getTokenClient(callback) {
+    if (!window.google) return null;
+    tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
       client_id: GOOGLE_CLIENT_ID,
       scope: DRIVE_SCOPE + " https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email",
-      callback: async (resp) => {
-        if (resp.error) { console.error(resp); return; }
-        const token = resp.access_token;
-        setGToken(token);
-        // Fetch user info
-        const uRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { Authorization: `Bearer ${token}` } });
-        const uData = await uRes.json();
-        const user = { name: uData.name, email: uData.email, picture: uData.picture };
-        setGUser(user);
-        try { localStorage.setItem("taskflow_guser", JSON.stringify(user)); } catch {}
-        // Load data from Drive
-        await loadFromDrive(token);
-      },
+      prompt: "",          // empty = silent refresh if session exists, no popup
+      callback,
     });
-    client.requestAccessToken();
+    return tokenClientRef.current;
+  }
+
+  // ── Silent token refresh (no user interaction needed) ────────────────────
+  function silentTokenRefresh() {
+    const client = getTokenClient(async (resp) => {
+      if (resp.error) {
+        // Session expired — need user to sign in again
+        setSyncStatus("error");
+        return;
+      }
+      const token = resp.access_token;
+      setGToken(token);
+      gTokenRef.current = token;
+      // Resolve fileId if we don't have it yet
+      if (!driveFileIdRef.current) {
+        const fid = await driveGetFileId(token);
+        if (fid) { setDriveFileId(fid); driveFileIdRef.current = fid; }
+      }
+    });
+    if (client) client.requestAccessToken({ prompt: "" });
+  }
+
+  // ── Schedule token refresh every 45 minutes (token lasts 60 min) ─────────
+  function scheduleTokenRefresh() {
+    if (tokenRefreshTimer.current) clearInterval(tokenRefreshTimer.current);
+    tokenRefreshTimer.current = setInterval(() => {
+      silentTokenRefresh();
+    }, 45 * 60 * 1000); // 45 minutes
+  }
+
+  // ── Google Sign In (first time — shows consent popup) ────────────────────
+  function handleGoogleSignIn() {
+    if (!window.google) { alert("Google SDK not loaded yet, please wait a moment."); return; }
+    const client = getTokenClient(async (resp) => {
+      if (resp.error) { console.error(resp); return; }
+      const token = resp.access_token;
+      setGToken(token);
+      gTokenRef.current = token;
+      // Fetch user profile
+      const uRes  = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { Authorization: `Bearer ${token}` } });
+      const uData = await uRes.json();
+      const user  = { name: uData.name, email: uData.email, picture: uData.picture };
+      setGUser(user);
+      try { localStorage.setItem("taskflow_guser", JSON.stringify(user)); } catch {}
+      // Load Drive data then start refresh cycle
+      await loadFromDrive(token);
+      scheduleTokenRefresh();
+    });
+    client.requestAccessToken({ prompt: "consent" });
   }
 
   function handleGoogleSignOut() {
-    setGToken(null); setGUser(null); setDriveFileId(null); setSyncStatus("idle"); setLastSaved("");
+    if (tokenRefreshTimer.current) clearInterval(tokenRefreshTimer.current);
+    if (syncTimer.current) clearTimeout(syncTimer.current);
+    setGToken(null); setGUser(null); setDriveFileId(null);
+    setSyncStatus("idle"); setLastSaved("");
+    gTokenRef.current = null; driveFileIdRef.current = null;
     try { localStorage.removeItem("taskflow_guser"); } catch {}
-    if (window.google) window.google.accounts.oauth2.revoke(gToken || "", () => {});
+    if (window.google) window.google.accounts.oauth2.revoke(gTokenRef.current || "", () => {});
     setShowGDrive(false);
   }
 
@@ -276,15 +332,15 @@ export default function App() {
       setSyncStatus("syncing");
       const fileId = await driveGetFileId(token);
       if (fileId) {
-        setDriveFileId(fileId);
+        setDriveFileId(fileId); driveFileIdRef.current = fileId;
         const data = await driveReadFile(token, fileId);
         if (data.tasks) { setTasks(data.tasks); setNextId(data.nextId || 7); }
         setSyncStatus("ok");
         setLastSaved("Drive");
       } else {
-        // First time — write current local tasks to Drive
-        const newId = await driveWriteFile(token, null, { tasks, nextId });
-        setDriveFileId(newId);
+        // First time — push local tasks up
+        const newFid = await driveWriteFile(token, null, { tasks, nextId });
+        setDriveFileId(newFid); driveFileIdRef.current = newFid;
         setSyncStatus("ok");
         setLastSaved("just now");
       }
@@ -294,23 +350,42 @@ export default function App() {
     }
   }
 
-  // ── Auto-save to Drive whenever tasks change ──────────────────────────────
-  const saveToD = useCallback(async (token, fileId, tasksSnap, nextIdSnap) => {
+  // ── Core save function — always uses latest token + fileId from refs ──────
+  const saveToD = useCallback(async (tasksSnap, nextIdSnap) => {
+    const token  = gTokenRef.current;
+    const fileId = driveFileIdRef.current;
+    if (!token) return;
     try {
       setSyncStatus("syncing");
       const newFid = await driveWriteFile(token, fileId, { tasks: tasksSnap, nextId: nextIdSnap });
-      if (!fileId && newFid) setDriveFileId(newFid);
+      if (!fileId && newFid) { setDriveFileId(newFid); driveFileIdRef.current = newFid; }
       setSyncStatus("ok");
-      const t = new Date(); setLastSaved(`${t.getHours()}:${String(t.getMinutes()).padStart(2,"0")}`);
-    } catch { setSyncStatus("error"); }
+      const t = new Date();
+      setLastSaved(`${t.getHours()}:${String(t.getMinutes()).padStart(2,"0")}`);
+    } catch (err) {
+      // If 401 (token expired), silently refresh then retry once
+      if (err?.status === 401 || String(err).includes("401")) {
+        silentTokenRefresh();
+        setTimeout(() => saveToD(tasksSnap, nextIdSnap), 3000);
+      } else {
+        setSyncStatus("error");
+      }
+    }
   }, []);
 
+  // ── Debounced auto-save — fires 1.5s after any task/nextId change ─────────
   useEffect(() => {
-    if (!gToken) return;
+    if (!gTokenRef.current) return;
     if (syncTimer.current) clearTimeout(syncTimer.current);
-    syncTimer.current = setTimeout(() => { saveToD(gToken, driveFileId, tasks, nextId); }, 1500);
+    syncTimer.current = setTimeout(() => saveToD(tasks, nextId), 1500);
     return () => clearTimeout(syncTimer.current);
-  }, [tasks, nextId, gToken, driveFileId, saveToD]);
+  }, [tasks, nextId, saveToD]);
+
+  // ── Re-start token refresh cycle when token is set ────────────────────────
+  useEffect(() => {
+    if (gToken) scheduleTokenRefresh();
+    return () => { if (tokenRefreshTimer.current) clearInterval(tokenRefreshTimer.current); };
+  }, [gToken]);
 
   // ── Theme ─────────────────────────────────────────────────────────────────
   const T = THEMES[settings.theme] || THEMES.dark;
@@ -450,7 +525,7 @@ export default function App() {
           {/* Sync status bar */}
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, minHeight:18 }}>
             <SyncBadge status={syncStatus} lastSaved={lastSaved} T={T}/>
-            {!gUser && <span style={{ color:T.textMuted, fontSize:10, fontFamily:"'DM Mono',monospace" }}>Tap 👤 to enable Drive sync</span>}
+            {!gUser && <span style={{ color:T.textMuted, fontSize:10, fontFamily:"'DM Mono',monospace" }}>Tap 👤 to enable auto-sync</span>}
             {gUser  && <span style={{ color:T.textMuted, fontSize:10, fontFamily:"'DM Mono',monospace" }}>{gUser.email}</span>}
           </div>
 
@@ -551,7 +626,7 @@ export default function App() {
             <div className="slide-up" onClick={e=>e.stopPropagation()} style={modalSheet}>
               <div style={dragPill}/>
               <h2 style={{ color:T.text, fontSize:18, fontWeight:600, marginBottom:6 }}>☁ Google Drive Sync</h2>
-              <p style={{ color:T.textMuted, fontSize:13, marginBottom:24, lineHeight:1.5 }}>Your tasks are saved to a private file in your Google Drive and synced across all devices automatically.</p>
+              <p style={{ color:T.textMuted, fontSize:13, marginBottom:24, lineHeight:1.5 }}>Your tasks sync automatically to Google Drive every time you make a change. Works across all your devices — just sign in.</p>
 
               {!gUser?(
                 <>
@@ -588,11 +663,8 @@ export default function App() {
                     </div>
                   </div>
                   <div style={{ display:"flex", gap:10, marginBottom:12 }}>
-                    <button className="btn-tap" onClick={()=>loadFromDrive(gToken)} style={{ flex:1, padding:"12px", borderRadius:12, border:`1px solid ${T.border2}`, background:T.inputBg, color:T.text, fontWeight:500, fontSize:14, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
-                      ↓ Pull from Drive
-                    </button>
-                    <button className="btn-tap" onClick={()=>saveToD(gToken,driveFileId,tasks,nextId)} style={{ flex:1, padding:"12px", borderRadius:12, border:"none", background:"linear-gradient(135deg,#6E5BFF,#B44DFF)", color:"white", fontWeight:600, fontSize:14, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
-                      ↑ Push to Drive
+                    <button className="btn-tap" onClick={()=>loadFromDrive(gTokenRef.current)} style={{ flex:1, padding:"12px", borderRadius:12, border:`1px solid ${T.border2}`, background:T.inputBg, color:T.text, fontWeight:500, fontSize:14, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
+                      ↓ Reload from Drive
                     </button>
                   </div>
                   <button className="btn-tap" onClick={handleGoogleSignOut} style={{ width:"100%", padding:"12px", borderRadius:12, border:"1px solid #FF2D5530", background:"#FF2D5510", color:"#FF2D55", fontWeight:500, fontSize:14, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
